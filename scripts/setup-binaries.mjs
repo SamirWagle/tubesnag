@@ -7,11 +7,11 @@
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   createWriteStream,
   existsSync,
   mkdirSync,
   readdirSync,
-  renameSync,
   rmSync,
 } from "node:fs";
 import { pipeline } from "node:stream/promises";
@@ -63,6 +63,15 @@ async function setupYtDlp() {
   console.log(`  -> ${dest}`);
 }
 
+// The extract dir lives under the OS temp dir, which can be on a different
+// drive/filesystem than BINARIES_DIR (e.g. GitHub's Windows runner checks
+// out to D:\ but os.tmpdir() is on C:\) — fs.renameSync can't move across
+// devices, so copy-then-delete instead.
+function moveFile(src, dest) {
+  copyFileSync(src, dest);
+  rmSync(src, { force: true });
+}
+
 // Downloads an archive, extracts it with the platform's native tool, finds
 // the ffmpeg binary inside (`locate`), and moves just that file into place.
 async function downloadExtractAndPlace({ url, archiveExt, extract, locate, dest }) {
@@ -72,7 +81,7 @@ async function downloadExtractAndPlace({ url, archiveExt, extract, locate, dest 
   await download(url, archivePath);
   mkdirSync(extractDir, { recursive: true });
   extract(archivePath, extractDir);
-  renameSync(locate(extractDir), dest);
+  moveFile(locate(extractDir), dest);
   if (process.platform !== "win32") chmodSync(dest, 0o755);
 
   rmSync(archivePath, { force: true });
