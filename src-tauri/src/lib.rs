@@ -5,7 +5,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 
-const FFMPEG_BIN_NAME: &str = "ffmpeg-x86_64-pc-windows-msvc.exe";
+// Tauri strips the `-<target-triple>` suffix off sidecar binaries when it
+// copies them next to the app executable (both in dev and in a bundled
+// build) — the suffix is only a source-file naming convention.
+const FFMPEG_BIN_NAME: &str = "ffmpeg.exe";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct VideoMeta {
