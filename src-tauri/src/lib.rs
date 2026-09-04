@@ -18,6 +18,7 @@ struct VideoMeta {
     thumbnail: Option<String>,
     uploader: Option<String>,
     duration: Option<f64>,
+    video_qualities: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -189,6 +190,23 @@ async fn fetch_metadata(app: AppHandle, id: String, url: String) -> Result<Video
         .map(|s| s.to_string());
     let duration = json.get("duration").and_then(|v| v.as_f64());
 
+    let mut heights: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    if let Some(formats) = json.get("formats").and_then(|v| v.as_array()) {
+        for f in formats {
+            let has_video = f
+                .get("vcodec")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v != "none");
+            if has_video {
+                if let Some(h) = f.get("height").and_then(|v| v.as_i64()) {
+                    heights.insert(h);
+                }
+            }
+        }
+    }
+    let mut video_qualities: Vec<String> = vec!["best".to_string()];
+    video_qualities.extend(heights.iter().rev().map(|h| format!("{h}p")));
+
     Ok(VideoMeta {
         id,
         url,
@@ -196,6 +214,7 @@ async fn fetch_metadata(app: AppHandle, id: String, url: String) -> Result<Video
         thumbnail,
         uploader,
         duration,
+        video_qualities,
     })
 }
 
@@ -206,6 +225,7 @@ async fn start_download(
     url: String,
     save_dir: String,
     mode: String,
+    quality: String,
 ) -> Result<(), String> {
     if !is_youtube_url(&url) {
         return Err("Not a valid YouTube link".into());
@@ -241,23 +261,33 @@ async fn start_download(
         .sidecar("yt-dlp")
         .map_err(|e| e.to_string())?;
 
+    let format_str: String;
+    let audio_quality_arg: String;
     let mut args: Vec<&str> = Vec::new();
+
     if is_video {
-        args.extend([
-            "-f",
-            "bv*+ba/b",
-            "--merge-output-format",
-            "mp4",
-        ]);
+        format_str = if quality == "best" || quality.is_empty() {
+            "bv*+ba/b".to_string()
+        } else {
+            let height = quality.trim_end_matches('p');
+            format!("bv*[height<={height}]+ba/b[height<={height}]")
+        };
+        args.extend(["-f", &format_str, "--merge-output-format", "mp4"]);
     } else {
+        format_str = "bestaudio/best".to_string();
+        audio_quality_arg = if quality == "best" || quality.is_empty() {
+            "0".to_string()
+        } else {
+            quality.clone()
+        };
         args.extend([
             "-f",
-            "bestaudio/best",
+            &format_str,
             "--extract-audio",
             "--audio-format",
             "mp3",
             "--audio-quality",
-            "192K",
+            &audio_quality_arg,
         ]);
     }
     args.extend([
