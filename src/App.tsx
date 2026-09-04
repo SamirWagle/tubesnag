@@ -12,6 +12,7 @@ const YOUTUBE_RE =
 
 type Status =
   | "fetching"
+  | "pending"
   | "starting"
   | "downloading"
   | "converting"
@@ -21,6 +22,14 @@ type Status =
   | "error";
 
 type Mode = "audio" | "video";
+
+const AUDIO_QUALITIES: { value: string; label: string }[] = [
+  { value: "best", label: "Best" },
+  { value: "320", label: "320 kbps" },
+  { value: "256", label: "256 kbps" },
+  { value: "192", label: "192 kbps" },
+  { value: "128", label: "128 kbps" },
+];
 
 interface DownloadItem {
   id: string;
@@ -36,6 +45,8 @@ interface DownloadItem {
   error?: string;
   filePath?: string;
   mode: Mode;
+  quality: string;
+  videoQualities: string[];
 }
 
 interface ProgressPayload {
@@ -58,6 +69,8 @@ function statusLabel(status: Status, mode: Mode): string {
   switch (status) {
     case "fetching":
       return "Fetching info…";
+    case "pending":
+      return "Ready";
     case "starting":
       return "Starting…";
     case "downloading":
@@ -78,6 +91,7 @@ function statusLabel(status: Status, mode: Mode): string {
 function StatusBadge({ status, mode }: { status: Status; mode: Mode }) {
   const styles: Record<Status, string> = {
     fetching: "bg-slate-700/60 text-slate-300",
+    pending: "bg-sky-500/20 text-sky-300",
     starting: "bg-slate-700/60 text-slate-300",
     downloading: "bg-indigo-500/20 text-indigo-300",
     converting: "bg-amber-500/20 text-amber-300",
@@ -93,16 +107,58 @@ function StatusBadge({ status, mode }: { status: Status; mode: Mode }) {
   );
 }
 
+function ModeToggle({
+  mode,
+  onChange,
+}: {
+  mode: Mode;
+  onChange: (mode: Mode) => void;
+}) {
+  return (
+    <div className="no-drag flex rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] p-0.5 text-xs">
+      {(["audio", "video"] as Mode[]).map((m) => (
+        <button
+          key={m}
+          onClick={() => onChange(m)}
+          className={`rounded px-2 py-1 font-medium capitalize transition-colors ${
+            mode === m
+              ? "bg-gradient-to-r from-[var(--color-accent)] to-[var(--color-accent-2)] text-white"
+              : "text-[var(--color-text-dim)] hover:text-[var(--color-text)]"
+          }`}
+        >
+          {m}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function QueueCard({
   item,
   onOpenFolder,
   onRetry,
+  onModeChange,
+  onQualityChange,
+  onStartDownload,
 }: {
   item: DownloadItem;
   onOpenFolder: (path: string) => void;
   onRetry: (item: DownloadItem) => void;
+  onModeChange: (item: DownloadItem, mode: Mode) => void;
+  onQualityChange: (item: DownloadItem, quality: string) => void;
+  onStartDownload: (item: DownloadItem) => void;
 }) {
-  const busy = !["done", "error", "fetching"].includes(item.status);
+  const busy = ["starting", "downloading", "converting", "embedding", "tagging"].includes(
+    item.status,
+  );
+  const qualityOptions =
+    item.mode === "audio"
+      ? AUDIO_QUALITIES
+      : item.videoQualities.map((q) => ({
+          value: q,
+          label: q === "best" ? "Best available" : q,
+        }));
+
   return (
     <div className="flex gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)] p-3">
       <div className="h-16 w-28 shrink-0 overflow-hidden rounded-lg bg-[var(--color-panel-2)]">
@@ -127,6 +183,29 @@ function QueueCard({
           {item.uploader ? ` · ${item.uploader}` : ""}
           {item.duration ? ` · ${formatDuration(item.duration)}` : ""}
         </p>
+
+        {item.status === "pending" && (
+          <div className="no-drag mt-2 flex flex-wrap items-center gap-2">
+            <ModeToggle mode={item.mode} onChange={(m) => onModeChange(item, m)} />
+            <select
+              value={item.quality}
+              onChange={(e) => onQualityChange(item, e.target.value)}
+              className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2 py-1 text-xs text-[var(--color-text)] outline-none"
+            >
+              {qualityOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={() => onStartDownload(item)}
+              className="ml-auto rounded-md bg-gradient-to-r from-[var(--color-accent)] to-[var(--color-accent-2)] px-3 py-1 text-xs font-semibold text-white hover:opacity-90"
+            >
+              Download
+            </button>
+          </div>
+        )}
 
         {busy && (
           <div className="mt-2">
@@ -231,6 +310,9 @@ export default function App() {
     };
   }, []);
 
+  // Fetches info for a link and adds it to the queue as "pending" — it does
+  // NOT start downloading. The user picks audio/video + quality on the card
+  // and confirms with its own Download button.
   const addLink = useCallback(async (rawUrl: string, modeOverride?: Mode) => {
     const url = rawUrl.trim();
     if (!url || !YOUTUBE_RE.test(url)) return;
@@ -248,6 +330,8 @@ export default function App() {
       title: "Loading video info…",
       status: "fetching",
       mode: currentMode,
+      quality: "best",
+      videoQualities: ["best"],
     };
     setItems((prev) => [placeholder, ...prev]);
 
@@ -259,6 +343,7 @@ export default function App() {
         thumbnail?: string;
         uploader?: string;
         duration?: number;
+        video_qualities: string[];
       }>("fetch_metadata", { id, url });
 
       setItems((prev) =>
@@ -270,29 +355,34 @@ export default function App() {
                 thumbnail: meta.thumbnail,
                 uploader: meta.uploader,
                 duration: meta.duration,
-                status: "starting",
+                videoQualities: meta.video_qualities,
+                status: "pending",
               }
             : it,
         ),
       );
-
-      invoke("start_download", {
-        id,
-        url,
-        saveDir: saveDirRef.current,
-        mode: currentMode,
-      }).catch((err: unknown) => {
-        setItems((prev) =>
-          prev.map((it) =>
-            it.id === id ? { ...it, status: "error", error: String(err) } : it,
-          ),
-        );
-      });
     } catch (err) {
       setItems((prev) =>
         prev.map((it) => (it.id === id ? { ...it, status: "error", error: String(err) } : it)),
       );
     }
+  }, []);
+
+  const handleStartDownload = useCallback((item: DownloadItem) => {
+    setItems((prev) =>
+      prev.map((it) => (it.id === item.id ? { ...it, status: "starting" } : it)),
+    );
+    invoke("start_download", {
+      id: item.id,
+      url: item.url,
+      saveDir: saveDirRef.current,
+      mode: item.mode,
+      quality: item.quality,
+    }).catch((err: unknown) => {
+      setItems((prev) =>
+        prev.map((it) => (it.id === item.id ? { ...it, status: "error", error: String(err) } : it)),
+      );
+    });
   }, []);
 
   useEffect(() => {
@@ -352,6 +442,18 @@ export default function App() {
     addLink(item.url, item.mode);
   };
 
+  const handleItemModeChange = (item: DownloadItem, nextMode: Mode) => {
+    setItems((prev) =>
+      prev.map((it) =>
+        it.id === item.id ? { ...it, mode: nextMode, quality: "best" } : it,
+      ),
+    );
+  };
+
+  const handleItemQualityChange = (item: DownloadItem, quality: string) => {
+    setItems((prev) => prev.map((it) => (it.id === item.id ? { ...it, quality } : it)));
+  };
+
   const handleToggleAutoWatch = (enabled: boolean) => {
     setAutoWatch(enabled);
     invoke("set_auto_watch", { enabled }).catch(() => {});
@@ -406,9 +508,7 @@ export default function App() {
             <span className="gradient-text">Paste a YouTube link</span>
           </h1>
           <p className="mt-0.5 text-sm text-[var(--color-text-dim)]">
-            {mode === "video"
-              ? "Downloads the full video as MP4."
-              : "Downloads as MP3 with embedded album art."}
+            We'll fetch the info first — you pick audio or video and quality before anything downloads.
           </p>
         </div>
 
@@ -454,7 +554,7 @@ export default function App() {
             onClick={handleManualAdd}
             className="no-drag rounded-lg bg-gradient-to-r from-[var(--color-accent)] to-[var(--color-accent-2)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-black/20 hover:opacity-90"
           >
-            Download
+            Add
           </button>
         </div>
 
@@ -467,7 +567,7 @@ export default function App() {
               className="accent-[var(--color-accent)]"
             />
             <span className="text-[var(--color-text-dim)]">
-              Auto-download links copied to clipboard
+              Auto-detect links copied to clipboard
             </span>
           </label>
 
@@ -494,7 +594,7 @@ export default function App() {
           {items.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-[var(--color-text-dim)]">
               <p className="text-sm">No downloads yet</p>
-              <p className="text-xs">Paste a link above, or copy one — it'll pick it up.</p>
+              <p className="text-xs">Paste a link above, or copy one — it'll show up here to preview.</p>
             </div>
           ) : (
             items.map((item) => (
@@ -503,6 +603,9 @@ export default function App() {
                 item={item}
                 onOpenFolder={handleOpenFolder}
                 onRetry={handleRetry}
+                onModeChange={handleItemModeChange}
+                onQualityChange={handleItemQualityChange}
+                onStartDownload={handleStartDownload}
               />
             ))
           )}
