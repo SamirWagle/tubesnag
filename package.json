@@ -1,0 +1,47 @@
+{
+  "name": "tubesnag",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A fast, open-source desktop app for grabbing YouTube videos as MP3 or MP4 — built with Tauri, React, and yt-dlp.",
+  "author": "Samir Wagle",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SamirWagle/tubesnag.git"
+  },
+  "keywords": [
+    "youtube-downloader",
+    "yt-dlp",
+    "tauri",
+    "desktop-app",
+    "mp3-downloader",
+    "video-downloader"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "setup": "node scripts/setup-binaries.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-shell": "^2.3.6",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4"
+  }
+}
