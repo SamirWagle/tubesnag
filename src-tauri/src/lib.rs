@@ -7,8 +7,12 @@ use tauri_plugin_shell::ShellExt;
 
 // Tauri strips the `-<target-triple>` suffix off sidecar binaries when it
 // copies them next to the app executable (both in dev and in a bundled
-// build) — the suffix is only a source-file naming convention.
-const FFMPEG_BIN_NAME: &str = "ffmpeg.exe";
+// build) — the suffix is only a source-file naming convention. The
+// remaining name still needs the platform's executable extension
+// (`.exe` on Windows, none on macOS/Linux).
+fn ffmpeg_bin_name() -> String {
+    format!("ffmpeg{}", std::env::consts::EXE_SUFFIX)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct VideoMeta {
@@ -59,10 +63,58 @@ fn ffmpeg_dir() -> Result<PathBuf, String> {
         .parent()
         .ok_or_else(|| "could not resolve app directory".to_string())?
         .to_path_buf();
-    if dir.join(FFMPEG_BIN_NAME).exists() {
+    if dir.join(ffmpeg_bin_name()).exists() {
         Ok(dir)
     } else {
         Err(format!("ffmpeg binary not found next to app in {:?}", dir))
+    }
+}
+
+fn is_playlist_url(url: &str) -> bool {
+    let u = url.to_lowercase();
+    (u.contains("youtube.com/playlist")) && u.contains("list=")
+}
+
+/// Extracts the distinct available video resolutions (e.g. ["best", "1080p",
+/// "720p"]) from a yt-dlp `--dump-single-json` payload's `formats` array.
+fn parse_video_qualities(json: &serde_json::Value) -> Vec<String> {
+    let mut heights: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    if let Some(formats) = json.get("formats").and_then(|v| v.as_array()) {
+        for f in formats {
+            let has_video = f
+                .get("vcodec")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v != "none");
+            if has_video {
+                if let Some(h) = f.get("height").and_then(|v| v.as_i64()) {
+                    heights.insert(h);
+                }
+            }
+        }
+    }
+    let mut qualities: Vec<String> = vec!["best".to_string()];
+    qualities.extend(heights.iter().rev().map(|h| format!("{h}p")));
+    qualities
+}
+
+/// Builds the yt-dlp `-f` format selector (and, for audio, the
+/// `--audio-quality` value) for the given mode/quality choice.
+fn build_format_args(is_video: bool, quality: &str) -> (String, Option<String>) {
+    if is_video {
+        let format_str = if quality == "best" || quality.is_empty() {
+            "bv*+ba/b".to_string()
+        } else {
+            let height = quality.trim_end_matches('p');
+            format!("bv*[height<={height}]+ba/b[height<={height}]")
+        };
+        (format_str, None)
+    } else {
+        let audio_quality = if quality == "best" || quality.is_empty() {
+            "0".to_string()
+        } else {
+            quality.to_string()
+        };
+        ("bestaudio/best".to_string(), Some(audio_quality))
     }
 }
 
@@ -140,6 +192,55 @@ fn set_mode(app: AppHandle, mode: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn fetch_playlist_entries(app: AppHandle, url: String) -> Result<Vec<String>, String> {
+    if !is_playlist_url(&url) {
+        return Err("Not a playlist link".into());
+    }
+
+    let sidecar = app
+        .shell()
+        .sidecar("yt-dlp")
+        .map_err(|e| e.to_string())?;
+
+    let output = sidecar
+        .args(["--flat-playlist", "--dump-single-json", "--no-warnings", &url])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(if err.is_empty() {
+            "yt-dlp failed to read this playlist".to_string()
+        } else {
+            err
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("could not parse playlist info: {e}"))?;
+
+    let urls: Vec<String> = json
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+                .map(|id| format!("https://www.youtube.com/watch?v={id}"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if urls.is_empty() {
+        return Err("No videos found in this playlist".to_string());
+    }
+
+    Ok(urls)
+}
+
+#[tauri::command]
 async fn fetch_metadata(app: AppHandle, id: String, url: String) -> Result<VideoMeta, String> {
     if !is_youtube_url(&url) {
         return Err("Not a valid YouTube link".into());
@@ -190,22 +291,7 @@ async fn fetch_metadata(app: AppHandle, id: String, url: String) -> Result<Video
         .map(|s| s.to_string());
     let duration = json.get("duration").and_then(|v| v.as_f64());
 
-    let mut heights: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
-    if let Some(formats) = json.get("formats").and_then(|v| v.as_array()) {
-        for f in formats {
-            let has_video = f
-                .get("vcodec")
-                .and_then(|v| v.as_str())
-                .is_some_and(|v| v != "none");
-            if has_video {
-                if let Some(h) = f.get("height").and_then(|v| v.as_i64()) {
-                    heights.insert(h);
-                }
-            }
-        }
-    }
-    let mut video_qualities: Vec<String> = vec!["best".to_string()];
-    video_qualities.extend(heights.iter().rev().map(|h| format!("{h}p")));
+    let video_qualities = parse_video_qualities(&json);
 
     Ok(VideoMeta {
         id,
@@ -261,25 +347,12 @@ async fn start_download(
         .sidecar("yt-dlp")
         .map_err(|e| e.to_string())?;
 
-    let format_str: String;
-    let audio_quality_arg: String;
+    let (format_str, audio_quality_arg) = build_format_args(is_video, &quality);
     let mut args: Vec<&str> = Vec::new();
 
     if is_video {
-        format_str = if quality == "best" || quality.is_empty() {
-            "bv*+ba/b".to_string()
-        } else {
-            let height = quality.trim_end_matches('p');
-            format!("bv*[height<={height}]+ba/b[height<={height}]")
-        };
         args.extend(["-f", &format_str, "--merge-output-format", "mp4"]);
     } else {
-        format_str = "bestaudio/best".to_string();
-        audio_quality_arg = if quality == "best" || quality.is_empty() {
-            "0".to_string()
-        } else {
-            quality.clone()
-        };
         args.extend([
             "-f",
             &format_str,
@@ -287,7 +360,7 @@ async fn start_download(
             "--audio-format",
             "mp3",
             "--audio-quality",
-            &audio_quality_arg,
+            audio_quality_arg.as_deref().unwrap_or("0"),
         ]);
     }
     args.extend([
@@ -413,6 +486,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             fetch_metadata,
+            fetch_playlist_entries,
             start_download,
             get_settings,
             set_save_dir,
@@ -421,4 +495,102 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recognizes_watch_urls() {
+        assert!(is_youtube_url("https://www.youtube.com/watch?v=abc123"));
+        assert!(is_youtube_url("https://youtu.be/abc123"));
+        assert!(is_youtube_url("https://www.youtube.com/shorts/abc123"));
+        assert!(is_youtube_url("https://music.youtube.com/watch?v=abc123"));
+        assert!(is_youtube_url("HTTPS://WWW.YOUTUBE.COM/WATCH?V=abc123"));
+    }
+
+    #[test]
+    fn rejects_non_youtube_urls() {
+        assert!(!is_youtube_url("https://vimeo.com/12345"));
+        assert!(!is_youtube_url("not a url at all"));
+        assert!(!is_youtube_url(""));
+    }
+
+    #[test]
+    fn recognizes_playlist_urls() {
+        assert!(is_playlist_url("https://www.youtube.com/playlist?list=PLxyz"));
+        assert!(is_playlist_url("https://music.youtube.com/playlist?list=PLxyz"));
+    }
+
+    #[test]
+    fn rejects_playlist_page_without_list_param() {
+        assert!(!is_playlist_url("https://www.youtube.com/playlist"));
+    }
+
+    #[test]
+    fn watch_url_with_list_param_is_not_a_playlist_url() {
+        // A normal video link picked up while playing inside a playlist still
+        // carries `&list=`, but the user almost always means "just this
+        // video" — only the dedicated /playlist page counts as a playlist.
+        assert!(!is_playlist_url(
+            "https://www.youtube.com/watch?v=abc123&list=PLxyz"
+        ));
+    }
+
+    #[test]
+    fn parses_video_qualities_sorted_descending_with_best_first() {
+        let json = json!({
+            "formats": [
+                { "vcodec": "avc1", "height": 720 },
+                { "vcodec": "avc1", "height": 1080 },
+                { "vcodec": "none", "height": 2160 }, // audio-only, must be ignored
+                { "vcodec": "avc1", "height": 720 },  // duplicate height
+                { "vcodec": "vp9", "height": 360 },
+            ]
+        });
+        let qualities = parse_video_qualities(&json);
+        assert_eq!(qualities, vec!["best", "1080p", "720p", "360p"]);
+    }
+
+    #[test]
+    fn parses_video_qualities_with_no_formats() {
+        let json = json!({});
+        assert_eq!(parse_video_qualities(&json), vec!["best"]);
+    }
+
+    #[test]
+    fn builds_best_video_format_with_no_height_cap() {
+        let (format_str, audio_quality) = build_format_args(true, "best");
+        assert_eq!(format_str, "bv*+ba/b");
+        assert!(audio_quality.is_none());
+    }
+
+    #[test]
+    fn builds_capped_video_format_for_specific_resolution() {
+        let (format_str, audio_quality) = build_format_args(true, "720p");
+        assert_eq!(format_str, "bv*[height<=720]+ba/b[height<=720]");
+        assert!(audio_quality.is_none());
+    }
+
+    #[test]
+    fn builds_best_audio_quality_as_vbr_zero() {
+        let (format_str, audio_quality) = build_format_args(false, "best");
+        assert_eq!(format_str, "bestaudio/best");
+        assert_eq!(audio_quality.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn builds_specific_audio_bitrate() {
+        let (_, audio_quality) = build_format_args(false, "192");
+        assert_eq!(audio_quality.as_deref(), Some("192"));
+    }
+
+    #[test]
+    fn ffmpeg_bin_name_matches_platform_exe_suffix() {
+        let name = ffmpeg_bin_name();
+        assert!(name.starts_with("ffmpeg"));
+        assert_eq!(name, format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
+    }
 }

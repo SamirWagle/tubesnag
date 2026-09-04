@@ -5,10 +5,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { extractUrls, isPlaylistUrl, isYoutubeUrl } from "./lib/url";
 import "./App.css";
-
-const YOUTUBE_RE =
-  /(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com\/(watch\?.*v=|shorts\/)|youtu\.be\/)/i;
 
 type Status =
   | "fetching"
@@ -56,6 +54,34 @@ interface ProgressPayload {
   speed?: string;
   eta?: string;
   message?: string;
+}
+
+function makePlaceholder(id: string, url: string, title: string, mode: Mode): DownloadItem {
+  return {
+    id,
+    url,
+    title,
+    status: "fetching",
+    mode,
+    quality: "best",
+    videoQualities: ["best"],
+  };
+}
+
+// Runs `worker` over `items` with at most `limit` in flight at once.
+async function runWithLimit<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  async function runNext(): Promise<void> {
+    const current = index++;
+    if (current >= items.length) return;
+    await worker(items[current]);
+    await runNext();
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
 }
 
 function formatDuration(seconds?: number): string {
@@ -140,6 +166,7 @@ function QueueCard({
   onModeChange,
   onQualityChange,
   onStartDownload,
+  onDismiss,
 }: {
   item: DownloadItem;
   onOpenFolder: (path: string) => void;
@@ -147,10 +174,12 @@ function QueueCard({
   onModeChange: (item: DownloadItem, mode: Mode) => void;
   onQualityChange: (item: DownloadItem, quality: string) => void;
   onStartDownload: (item: DownloadItem) => void;
+  onDismiss: (item: DownloadItem) => void;
 }) {
   const busy = ["starting", "downloading", "converting", "embedding", "tagging"].includes(
     item.status,
   );
+  const dismissable = ["pending", "error", "done"].includes(item.status);
   const qualityOptions =
     item.mode === "audio"
       ? AUDIO_QUALITIES
@@ -176,7 +205,18 @@ function QueueCard({
           <p className="truncate text-sm font-medium text-[var(--color-text)]" title={item.title}>
             {item.title}
           </p>
-          <StatusBadge status={item.status} mode={item.mode} />
+          <div className="flex shrink-0 items-center gap-1.5">
+            <StatusBadge status={item.status} mode={item.mode} />
+            {dismissable && (
+              <button
+                onClick={() => onDismiss(item)}
+                aria-label="Dismiss"
+                className="no-drag flex h-4 w-4 items-center justify-center rounded-full text-[var(--color-text-dim)] hover:bg-white/10 hover:text-[var(--color-text)]"
+              >
+                ✕
+              </button>
+            )}
+          </div>
         </div>
         <p className="mt-0.5 truncate text-xs text-[var(--color-text-dim)]">
           {item.mode === "video" ? "Video" : "Audio"}
@@ -315,7 +355,7 @@ export default function App() {
   // and confirms with its own Download button.
   const addLink = useCallback(async (rawUrl: string, modeOverride?: Mode) => {
     const url = rawUrl.trim();
-    if (!url || !YOUTUBE_RE.test(url)) return;
+    if (!url || !isYoutubeUrl(url)) return;
 
     const activeSame = itemsRef.current.find(
       (it) => it.url === url && it.status !== "done" && it.status !== "error",
@@ -324,16 +364,7 @@ export default function App() {
 
     const id = crypto.randomUUID();
     const currentMode = modeOverride ?? modeRef.current;
-    const placeholder: DownloadItem = {
-      id,
-      url,
-      title: "Loading video info…",
-      status: "fetching",
-      mode: currentMode,
-      quality: "best",
-      videoQualities: ["best"],
-    };
-    setItems((prev) => [placeholder, ...prev]);
+    setItems((prev) => [makePlaceholder(id, url, "Loading video info…", currentMode), ...prev]);
 
     try {
       const meta = await invoke<{
@@ -368,6 +399,66 @@ export default function App() {
     }
   }, []);
 
+  // Expands a playlist link into its individual videos, then previews each
+  // one exactly like addLink would (own thumbnail, own quality options).
+  const addPlaylist = useCallback(
+    async (url: string, modeOverride?: Mode) => {
+      const activeSame = itemsRef.current.find(
+        (it) => it.url === url && it.status !== "done" && it.status !== "error",
+      );
+      if (activeSame) return;
+
+      const currentMode = modeOverride ?? modeRef.current;
+      const placeholderId = crypto.randomUUID();
+      setItems((prev) => [
+        makePlaceholder(placeholderId, url, "Loading playlist…", currentMode),
+        ...prev,
+      ]);
+
+      try {
+        const urls = await invoke<string[]>("fetch_playlist_entries", { url });
+        setItems((prev) => prev.filter((it) => it.id !== placeholderId));
+        // Some playlists (radio mixes, curated lists) repeat the same video;
+        // dedupe here rather than relying on addLink's queue check, since
+        // that check reads state that hasn't re-rendered yet mid-loop.
+        const uniqueUrls = [...new Set(urls)];
+        await runWithLimit(uniqueUrls, 4, (videoUrl) => addLink(videoUrl, currentMode));
+      } catch (err) {
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === placeholderId
+              ? { ...it, status: "error", error: String(err) }
+              : it,
+          ),
+        );
+      }
+    },
+    [addLink],
+  );
+
+  const addOne = useCallback(
+    (url: string, modeOverride?: Mode) => {
+      if (isPlaylistUrl(url)) {
+        addPlaylist(url, modeOverride);
+      } else {
+        addLink(url, modeOverride);
+      }
+    },
+    [addLink, addPlaylist],
+  );
+
+  // Entry point for anything that might contain one or more links (manual
+  // paste, clipboard paste) — splits batches, expands playlists, and
+  // previews everything else individually.
+  const addLinks = useCallback(
+    (text: string, modeOverride?: Mode) => {
+      for (const url of extractUrls(text)) {
+        addOne(url, modeOverride);
+      }
+    },
+    [addOne],
+  );
+
   const handleStartDownload = useCallback((item: DownloadItem) => {
     setItems((prev) =>
       prev.map((it) => (it.id === item.id ? { ...it, status: "starting" } : it)),
@@ -392,10 +483,11 @@ export default function App() {
         const text = await readText();
         if (text && text !== lastClipboard.current) {
           lastClipboard.current = text;
-          const trimmed = text.trim();
-          if (YOUTUBE_RE.test(trimmed) && !seenUrls.current.has(trimmed)) {
-            seenUrls.current.add(trimmed);
-            addLink(trimmed);
+          for (const url of extractUrls(text)) {
+            if (!seenUrls.current.has(url)) {
+              seenUrls.current.add(url);
+              addOne(url);
+            }
           }
         }
       } catch {
@@ -403,18 +495,18 @@ export default function App() {
       }
     }, 1200);
     return () => clearInterval(interval);
-  }, [autoWatch, addLink]);
+  }, [autoWatch, addOne]);
 
   const handleManualAdd = () => {
     if (!urlInput.trim()) return;
-    addLink(urlInput);
+    addLinks(urlInput);
     setUrlInput("");
   };
 
   const handlePasteNow = async () => {
     try {
       const text = await readText();
-      if (text) addLink(text);
+      if (text) addLinks(text);
     } catch {
       // ignore
     }
@@ -439,7 +531,11 @@ export default function App() {
   const handleRetry = (item: DownloadItem) => {
     seenUrls.current.delete(item.url);
     setItems((prev) => prev.filter((it) => it.id !== item.id));
-    addLink(item.url, item.mode);
+    addOne(item.url, item.mode);
+  };
+
+  const handleDismiss = (item: DownloadItem) => {
+    setItems((prev) => prev.filter((it) => it.id !== item.id));
   };
 
   const handleItemModeChange = (item: DownloadItem, nextMode: Mode) => {
@@ -462,6 +558,14 @@ export default function App() {
   const handleSetMode = (next: Mode) => {
     setMode(next);
     invoke("set_mode", { mode: next }).catch(() => {});
+  };
+
+  const pendingItems = items.filter((it) => it.status === "pending");
+
+  const handleDownloadAllPending = () => {
+    for (const item of pendingItems) {
+      handleStartDownload(item);
+    }
   };
 
   const win = getCurrentWindow();
@@ -590,6 +694,28 @@ export default function App() {
           </div>
         </div>
 
+        {pendingItems.length > 1 && (
+          <div className="flex items-center justify-between rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-2 text-xs">
+            <span className="text-[var(--color-text-dim)]">
+              {pendingItems.length} links ready to download
+            </span>
+            <div className="no-drag flex items-center gap-2">
+              <button
+                onClick={() => pendingItems.forEach(handleDismiss)}
+                className="rounded-md border border-[var(--color-border)] px-2 py-1 font-medium hover:bg-[var(--color-panel-2)]"
+              >
+                Clear all
+              </button>
+              <button
+                onClick={handleDownloadAllPending}
+                className="rounded-md bg-gradient-to-r from-[var(--color-accent)] to-[var(--color-accent-2)] px-3 py-1 font-semibold text-white hover:opacity-90"
+              >
+                Download all ({pendingItems.length})
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
           {items.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-[var(--color-text-dim)]">
@@ -606,6 +732,7 @@ export default function App() {
                 onModeChange={handleItemModeChange}
                 onQualityChange={handleItemQualityChange}
                 onStartDownload={handleStartDownload}
+                onDismiss={handleDismiss}
               />
             ))
           )}
