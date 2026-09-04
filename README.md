@@ -6,6 +6,12 @@
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![built with Tauri](https://img.shields.io/badge/built%20with-Tauri-24C8DB)
 
+## Screenshots
+
+| Idle | Preview + quality picker |
+|---|---|
+| ![Idle state](.github/assets/empty-state.png) | ![Preview with quality picker](.github/assets/preview-quality.png) |
+
 ## Features
 
 - 🎵 **Audio mode** — downloads the best available audio, converts to MP3, and embeds the video thumbnail as album art
